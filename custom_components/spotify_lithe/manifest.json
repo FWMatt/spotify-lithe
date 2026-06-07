@@ -1,13 +1,12 @@
 {
   "domain": "spotify_lithe",
   "name": "Spotify Lithe",
-  "codeowners": ["@matt"],
+  "codeowners": ["@FWMatt"],
   "config_flow": true,
   "dependencies": ["application_credentials"],
   "documentation": "https://github.com/FWMatt/spotify-lithe",
-  "issue_tracker": "https://github.com/FWMatt/spotify-lithe/issues",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "requirements": [],
+  "issue_tracker": "https://github.com/FWMatt/spotify-lithe/issues",
   "version": "0.1.0"
 }
