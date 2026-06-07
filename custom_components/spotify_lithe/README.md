@@ -85,6 +85,35 @@ Spotify app (the device-side step the integration can't do).
 > *idle* with no track until you select a playlist on it — Spotify only reports
 > now-playing for the single active device. Multi-account removes this per-room.
 
+## Latency & logging
+
+Each speaker entity exposes instrumentation as **state attributes** (visible in
+Developer Tools → States, and recorded to history so you can graph them):
+
+| Attribute | Meaning |
+|---|---|
+| `last_action` / `last_action_ms` / `last_action_at` | the most recent command and its **API round-trip** latency (ms) |
+| `playback_start_ms` | **command issued → audio actually playing** (measured by polling after a play/select-source; `null` until the first play, or if it didn't confirm within 15 s) |
+| `poll_ms` | latency of the most recent status poll |
+| `recent_actions` | rolling list of the last 8 commands (`action`, `ms`, `at`, `ok`) — an at-a-glance audit |
+
+**Detailed logs** — enable debug for the integration (then watch Settings →
+System → Logs):
+
+```yaml
+# configuration.yaml
+logger:
+  logs:
+    custom_components.spotify_lithe: debug
+```
+
+You get a line per command (`play on Guest WC Speaker: 84 ms (ok=True)`), per
+poll, and the playback-start time.
+
+**Audit event** — every command fires a `spotify_lithe_command` event
+(`entity_id`, `device`, `action`, `latency_ms`, `success`), usable in
+automations or to build a logbook trail.
+
 ## CLI companion
 
 `spotify-lithe` (repo root) is the standalone CLI built on the same engine

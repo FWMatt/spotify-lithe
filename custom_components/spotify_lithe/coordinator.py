@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 import logging
+import time
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_entry_oauth2_flow
@@ -29,6 +30,7 @@ class SpotifyLitheCoordinator(DataUpdateCoordinator[dict]):
         )
         self.session = session
         self._playlists: list | None = None
+        self.last_poll_ms: float | None = None  # latency of the most recent poll
 
     async def access_token(self) -> str:
         """A valid access token (refreshed by HA's OAuth helper as needed)."""
@@ -37,6 +39,7 @@ class SpotifyLitheCoordinator(DataUpdateCoordinator[dict]):
 
     async def _async_update_data(self) -> dict:
         token = await self.access_token()
+        start = time.monotonic()
         try:
             playback = await self.hass.async_add_executor_job(
                 spotify_api.current_playback, token
@@ -47,7 +50,18 @@ class SpotifyLitheCoordinator(DataUpdateCoordinator[dict]):
                     spotify_api.playlists, token
                 )
         except spotify_api.SpotifyAPIError as err:
+            self.last_poll_ms = round((time.monotonic() - start) * 1000, 1)
+            _LOGGER.debug("poll failed after %s ms: %s", self.last_poll_ms, err)
             raise UpdateFailed(str(err)) from err
+        self.last_poll_ms = round((time.monotonic() - start) * 1000, 1)
+        active = (playback.get("device") or {}).get("name")
+        _LOGGER.debug(
+            "poll %s ms — %d devices, active=%s, playing=%s",
+            self.last_poll_ms,
+            len(devices),
+            active,
+            playback.get("is_playing"),
+        )
         return {
             "playback": playback,
             "devices": devices,
