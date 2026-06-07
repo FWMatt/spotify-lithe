@@ -1,0 +1,25 @@
+{
+  "config": {
+    "step": {
+      "pick_implementation": {
+        "title": "Pick Authentication Method"
+      }
+    },
+    "abort": {
+      "already_configured": "This Spotify account is already configured",
+      "authorize_url_timeout": "Timeout generating authorize URL.",
+      "missing_configuration": "The integration is not configured. Add Spotify Application Credentials first.",
+      "no_url_available": "No URL available. For more information see the documentation.",
+      "oauth_error": "Received invalid token data.",
+      "oauth_failed": "Error while obtaining access token.",
+      "oauth_timeout": "Timeout resolving OAuth token.",
+      "reauth_successful": "Re-authentication was successful"
+    },
+    "create_entry": {
+      "default": "Successfully authenticated with Spotify"
+    }
+  },
+  "application_credentials": {
+    "description": "Create a Spotify app in the [developer console]({developer_console_url}) and add the redirect URI `{redirect_url}`, then enter its Client ID and Client Secret."
+  }
+}
