@@ -15,6 +15,9 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
+          # 'brands' requires registration in the home-assistant/brands repo;
+          # not needed for a custom-repository install, so skip that check.
+          ignore: brands
 
   hassfest:
     name: hassfest
