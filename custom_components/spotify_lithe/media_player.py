@@ -79,6 +79,10 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
         self._playback_start_ms: float | None = None  # command issued -> audio playing
         self._recent: deque = deque(maxlen=8)  # rolling audit of recent commands
         self._start_task: asyncio.Task | None = None
+        # diagnostics surfaced as entity attributes (no debug logging needed to see them)
+        self._last_error: str | None = None
+        self._last_error_at: str | None = None
+        self._last_start_ok: bool | None = None  # did the most recent play actually start?
         # optimistic overlay: the intended outcome shown instantly, reconciled on poll
         self._opt: dict | None = None  # {playing, active, volume, expires}
         self._repoll_tasks: list[asyncio.Task] = []
@@ -195,8 +199,17 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
             "last_action": self._last_action,
             "last_action_ms": self._last_action_ms,        # API command round-trip
             "last_action_at": self._last_action_at,
+            "last_action_ok": self._recent[0]["ok"] if self._recent else None,
             "playback_start_ms": self._playback_start_ms,  # command -> audio playing
+            "last_start_ok": self._last_start_ok,           # None=pending, False=stalled/no start
             "poll_ms": self.coordinator.last_poll_ms,       # last status-poll latency
+            "poll_ok": self.coordinator.last_update_success,
+            "poll_error": (
+                None if self.coordinator.last_update_success
+                else str(self.coordinator.last_exception)
+            ),
+            "error": self._last_error,                      # most recent command failure
+            "error_at": self._last_error_at,
             "recent_actions": list(self._recent),
             "device_id": self._device_id,
         }
@@ -261,6 +274,8 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
                 await self.hass.async_add_executor_job(functools.partial(fn, token, *args, **kwargs))
             except Exception as err:  # noqa: BLE001 - record failure then re-raise
                 ok = False
+                self._last_error = f"{label}: {err}"
+                self._last_error_at = dt_util.utcnow().isoformat()
                 _LOGGER.warning("%s on %s failed: %s", label, self._attr_name, err)
                 raise
             finally:
@@ -295,9 +310,15 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
         self._start_task = self.hass.async_create_task(self._await_playback_start(issued))
 
     async def _await_playback_start(self, issued: float, timeout: float = 15.0) -> None:
-        """Poll until this device is actually playing; record the elapsed time."""
+        """Poll until this device is actually playing; record the elapsed time.
+
+        A timeout here is the headline "I pressed play and nothing happened" signal
+        (e.g. a stalled Connect session) — surfaced via the `last_start_ok` attribute
+        and a warning, not just a debug line.
+        """
         deadline = issued + timeout
         delay = 0.5  # back off so we don't hammer the Web API for the full window
+        self._last_start_ok = None  # pending
         try:
             while time.monotonic() < deadline:
                 token = await self.coordinator.access_token()
@@ -309,6 +330,7 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
                     and (pb.get("progress_ms") or 0) > 0
                 ):
                     self._playback_start_ms = round((time.monotonic() - issued) * 1000, 1)
+                    self._last_start_ok = True
                     _LOGGER.debug(
                         "playback started on %s after %s ms", self._attr_name, self._playback_start_ms
                     )
@@ -317,12 +339,22 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
                 await asyncio.sleep(delay)
                 delay = min(delay * 1.4, 2.5)
             self._playback_start_ms = None  # didn't confirm start within the window
-            _LOGGER.debug("playback did not confirm start on %s within %ss", self._attr_name, timeout)
+            self._last_start_ok = False
+            _LOGGER.warning(
+                "%s: playback did not start within %ss after command — device may have "
+                "stalled (active=%s, is_playing=%s)",
+                self._attr_name,
+                timeout,
+                (self._playback.get("device") or {}).get("id") == self._device_id,
+                self._playback.get("is_playing"),
+            )
             self.async_write_ha_state()
         except asyncio.CancelledError:
             pass  # superseded by a newer play command
         except spotify_api.SpotifyAPIError as err:
-            _LOGGER.debug("playback-start tracking error on %s: %s", self._attr_name, err)
+            self._last_error = f"playback-start-poll: {err}"
+            self._last_error_at = dt_util.utcnow().isoformat()
+            _LOGGER.warning("playback-start tracking error on %s: %s", self._attr_name, err)
 
     @callback
     def _clear_optimistic(self) -> None:
