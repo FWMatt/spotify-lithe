@@ -34,6 +34,9 @@ SUPPORT = (
     | MediaPlayerEntityFeature.SELECT_SOURCE
 )
 
+OPTIMISTIC_TTL = 8.0          # seconds an override is trusted before reality must win
+REPOLL_DELAYS = (1.0, 3.0)    # extra refreshes after a command, to outrun Spotify lag
+
 
 async def async_setup_entry(hass, entry, async_add_entities: AddEntitiesCallback) -> None:
     """Create a media_player per Connect device, adding new ones as they appear."""
@@ -74,6 +77,37 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
         self._playback_start_ms: float | None = None  # command issued -> audio playing
         self._recent: deque = deque(maxlen=8)  # rolling audit of recent commands
         self._start_task: asyncio.Task | None = None
+        # optimistic overlay: the intended outcome shown instantly, reconciled on poll
+        self._opt: dict | None = None  # {playing, active, volume, expires}
+        self._repoll_tasks: list[asyncio.Task] = []
+
+    @callback
+    def _set_optimistic(
+        self,
+        *,
+        playing: bool | None = None,
+        active: bool | None = None,
+        volume: float | None = None,
+    ) -> None:
+        """Overlay the intended outcome for a short window, then push state at once."""
+        self._opt = {
+            "playing": playing,
+            "active": active,
+            "volume": volume,
+            "expires": time.monotonic() + OPTIMISTIC_TTL,
+        }
+        self.async_write_ha_state()
+
+    @property
+    def _optimistic(self) -> dict | None:
+        """The active override, or None if absent/expired (reading clears on timeout)."""
+        opt = self._opt
+        if opt is None:
+            return None
+        if time.monotonic() >= opt["expires"]:
+            self._opt = None
+            return None
+        return opt
 
     @property
     def _device(self) -> dict | None:
@@ -93,20 +127,29 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
     @property
     def _is_active(self) -> bool:
         # Spotify reports now-playing only for the single active device.
+        opt = self._optimistic
+        if opt is not None and opt["active"] is not None:
+            return opt["active"]
         return (self._playback.get("device") or {}).get("id") == self._device_id
 
     @property
     def state(self) -> MediaPlayerState:
-        if self._is_active:
-            return (
-                MediaPlayerState.PLAYING
-                if self._playback.get("is_playing")
-                else MediaPlayerState.PAUSED
-            )
-        return MediaPlayerState.IDLE
+        if not self._is_active:
+            return MediaPlayerState.IDLE
+        opt = self._optimistic
+        if opt is not None and opt["playing"] is not None:
+            return MediaPlayerState.PLAYING if opt["playing"] else MediaPlayerState.PAUSED
+        return (
+            MediaPlayerState.PLAYING
+            if self._playback.get("is_playing")
+            else MediaPlayerState.PAUSED
+        )
 
     @property
     def volume_level(self) -> float | None:
+        opt = self._optimistic
+        if opt is not None and opt["volume"] is not None:
+            return opt["volume"]
         dev = self._device
         vol = dev.get("volume_percent") if dev else None
         return vol / 100 if vol is not None else None
@@ -151,6 +194,48 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
             "device_id": self._device_id,
         }
 
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Clear the optimistic overlay once a poll confirms reality matches it."""
+        opt = self._optimistic  # also clears if expired
+        if opt is not None and self._reality_matches(opt):
+            self._opt = None
+        super()._handle_coordinator_update()
+
+    @callback
+    def _reality_matches(self, opt: dict) -> bool:
+        """True once coordinator data already reflects the intended outcome."""
+        real_active = (self._playback.get("device") or {}).get("id") == self._device_id
+        if opt["active"] is not None and opt["active"] != real_active:
+            return False
+        if opt["playing"] is not None:
+            if not real_active:
+                return False
+            if bool(self._playback.get("is_playing")) != opt["playing"]:
+                return False
+        if opt["volume"] is not None:
+            dev = self._device
+            real_vol = dev.get("volume_percent") if dev else None
+            if real_vol is None or round(real_vol / 100, 2) != round(opt["volume"], 2):
+                return False
+        return True
+
+    def _schedule_repolls(self) -> None:
+        """Delayed refreshes so Spotify's eventual consistency catches up < the 10s poll."""
+        for t in self._repoll_tasks:
+            if not t.done():
+                t.cancel()
+        self._repoll_tasks = [
+            self.hass.async_create_task(self._delayed_refresh(d)) for d in REPOLL_DELAYS
+        ]
+
+    async def _delayed_refresh(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            await self.coordinator.async_request_refresh()
+        except asyncio.CancelledError:
+            pass
+
     async def _call(self, label: str, fn, *args: Any, **kwargs: Any) -> None:
         """Issue a Web API command, recording its round-trip latency + an audit entry."""
         start = time.monotonic()
@@ -182,6 +267,7 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
             )
             self.async_write_ha_state()
         await self.coordinator.async_request_refresh()
+        self._schedule_repolls()
 
     async def _start_playback(self, label: str, **play_kwargs: Any) -> None:
         """Issue a play command and (in the background) time until audio starts."""
@@ -219,11 +305,27 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
         except spotify_api.SpotifyAPIError as err:
             _LOGGER.debug("playback-start tracking error on %s: %s", self._attr_name, err)
 
+    @callback
+    def _clear_optimistic(self) -> None:
+        """Drop the overlay (on command failure) so a bad command never sticks."""
+        self._opt = None
+        self.async_write_ha_state()
+
     async def async_media_play(self) -> None:
-        await self._start_playback("play")
+        self._set_optimistic(playing=True, active=True)
+        try:
+            await self._start_playback("play")
+        except Exception:
+            self._clear_optimistic()
+            raise
 
     async def async_media_pause(self) -> None:
-        await self._call("pause", spotify_api.pause, self._device_id)
+        self._set_optimistic(playing=False)  # active unchanged: stays this device
+        try:
+            await self._call("pause", spotify_api.pause, self._device_id)
+        except Exception:
+            self._clear_optimistic()
+            raise
 
     async def async_media_next_track(self) -> None:
         await self._call("next", spotify_api.next_track, self._device_id)
@@ -232,7 +334,12 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
         await self._call("previous", spotify_api.previous_track, self._device_id)
 
     async def async_set_volume_level(self, volume: float) -> None:
-        await self._call("volume", spotify_api.set_volume, int(volume * 100), self._device_id)
+        self._set_optimistic(volume=volume)
+        try:
+            await self._call("volume", spotify_api.set_volume, int(volume * 100), self._device_id)
+        except Exception:
+            self._clear_optimistic()
+            raise
 
     async def async_select_source(self, source: str) -> None:
         uri = next(
@@ -240,4 +347,15 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
             None,
         )
         if uri:
-            await self._start_playback(f"select_source:{source}", context_uri=uri)
+            self._set_optimistic(playing=True, active=True)
+            try:
+                await self._start_playback(f"select_source:{source}", context_uri=uri)
+            except Exception:
+                self._clear_optimistic()
+                raise
+
+    async def async_will_remove_from_hass(self) -> None:
+        for t in (*self._repoll_tasks, self._start_task):
+            if t and not t.done():
+                t.cancel()
+        await super().async_will_remove_from_hass()
