@@ -36,6 +36,8 @@ SUPPORT = (
 
 OPTIMISTIC_TTL = 8.0          # seconds an override is trusted before reality must win
 REPOLL_DELAYS = (1.0, 3.0)    # extra refreshes after a command, to outrun Spotify lag
+TOGGLE_DEBOUNCE = 0.3         # coalesce rapid play/pause toggles before hitting the device
+MIN_CMD_GAP = 0.3             # minimum spacing between device commands (protects a fragile LWF1)
 
 
 async def async_setup_entry(hass, entry, async_add_entities: AddEntitiesCallback) -> None:
@@ -80,6 +82,11 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
         # optimistic overlay: the intended outcome shown instantly, reconciled on poll
         self._opt: dict | None = None  # {playing, active, volume, expires}
         self._repoll_tasks: list[asyncio.Task] = []
+        # command pacing: serialise + space device commands; coalesce play/pause toggles
+        self._cmd_lock = asyncio.Lock()
+        self._last_cmd_mono = 0.0
+        self._toggle_gen = 0
+        self._desired_play: bool | None = None
 
     @callback
     def _set_optimistic(
@@ -237,37 +244,47 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
             pass
 
     async def _call(self, label: str, fn, *args: Any, **kwargs: Any) -> None:
-        """Issue a Web API command, recording its round-trip latency + an audit entry."""
-        start = time.monotonic()
-        ok = True
-        try:
-            token = await self.coordinator.access_token()
-            await self.hass.async_add_executor_job(functools.partial(fn, token, *args, **kwargs))
-        except Exception as err:  # noqa: BLE001 - record failure then re-raise
-            ok = False
-            _LOGGER.warning("%s on %s failed: %s", label, self._attr_name, err)
-            raise
-        finally:
-            ms = round((time.monotonic() - start) * 1000, 1)
-            at = dt_util.utcnow().isoformat()
-            self._last_action = label
-            self._last_action_ms = ms
-            self._last_action_at = at
-            self._recent.appendleft({"action": label, "ms": ms, "at": at, "ok": ok})
-            _LOGGER.debug("%s on %s: %s ms (ok=%s)", label, self._attr_name, ms, ok)
-            self.hass.bus.async_fire(
-                f"{DOMAIN}_command",
-                {
-                    "entity_id": self.entity_id,
-                    "device": self._attr_name,
-                    "action": label,
-                    "latency_ms": ms,
-                    "success": ok,
-                },
-            )
-            self.async_write_ha_state()
-        await self.coordinator.async_request_refresh()
-        self._schedule_repolls()
+        """Issue a Web API command, recording its round-trip latency + an audit entry.
+
+        Commands are serialised through a per-entity lock and spaced by at least
+        MIN_CMD_GAP, so a burst (rapid pause/play/skip) can't pile onto the fragile
+        LWF1 Connect client all at once.
+        """
+        async with self._cmd_lock:
+            gap = time.monotonic() - self._last_cmd_mono
+            if gap < MIN_CMD_GAP:
+                await asyncio.sleep(MIN_CMD_GAP - gap)
+            start = time.monotonic()
+            ok = True
+            try:
+                token = await self.coordinator.access_token()
+                await self.hass.async_add_executor_job(functools.partial(fn, token, *args, **kwargs))
+            except Exception as err:  # noqa: BLE001 - record failure then re-raise
+                ok = False
+                _LOGGER.warning("%s on %s failed: %s", label, self._attr_name, err)
+                raise
+            finally:
+                self._last_cmd_mono = time.monotonic()
+                ms = round((time.monotonic() - start) * 1000, 1)
+                at = dt_util.utcnow().isoformat()
+                self._last_action = label
+                self._last_action_ms = ms
+                self._last_action_at = at
+                self._recent.appendleft({"action": label, "ms": ms, "at": at, "ok": ok})
+                _LOGGER.debug("%s on %s: %s ms (ok=%s)", label, self._attr_name, ms, ok)
+                self.hass.bus.async_fire(
+                    f"{DOMAIN}_command",
+                    {
+                        "entity_id": self.entity_id,
+                        "device": self._attr_name,
+                        "action": label,
+                        "latency_ms": ms,
+                        "success": ok,
+                    },
+                )
+                self.async_write_ha_state()
+            await self.coordinator.async_request_refresh()
+            self._schedule_repolls()
 
     async def _start_playback(self, label: str, **play_kwargs: Any) -> None:
         """Issue a play command and (in the background) time until audio starts."""
@@ -280,6 +297,7 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
     async def _await_playback_start(self, issued: float, timeout: float = 15.0) -> None:
         """Poll until this device is actually playing; record the elapsed time."""
         deadline = issued + timeout
+        delay = 0.5  # back off so we don't hammer the Web API for the full window
         try:
             while time.monotonic() < deadline:
                 token = await self.coordinator.access_token()
@@ -296,7 +314,8 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
                     )
                     self.async_write_ha_state()
                     return
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(delay)
+                delay = min(delay * 1.4, 2.5)
             self._playback_start_ms = None  # didn't confirm start within the window
             _LOGGER.debug("playback did not confirm start on %s within %ss", self._attr_name, timeout)
             self.async_write_ha_state()
@@ -313,25 +332,48 @@ class SpotifyLitheMediaPlayer(CoordinatorEntity[SpotifyLitheCoordinator], MediaP
 
     async def async_media_play(self) -> None:
         self._set_optimistic(playing=True, active=True)
-        try:
-            await self._start_playback("play")
-        except Exception:
-            self._clear_optimistic()
-            raise
+        await self._debounced_toggle(True)
 
     async def async_media_pause(self) -> None:
         self._set_optimistic(playing=False)  # active unchanged: stays this device
+        await self._debounced_toggle(False)
+
+    async def _debounced_toggle(self, play: bool) -> None:
+        """Coalesce a rapid play/pause burst: the card flips instantly (optimistic),
+        but only the *latest* intent, after a short quiet window, reaches the device."""
+        self._desired_play = play
+        self._toggle_gen += 1
+        gen = self._toggle_gen
         try:
-            await self._call("pause", spotify_api.pause, self._device_id)
+            await asyncio.sleep(TOGGLE_DEBOUNCE)
+        except asyncio.CancelledError:
+            return
+        if gen != self._toggle_gen:
+            return  # a newer press superseded this one; it will dispatch the final state
+        try:
+            if self._desired_play:
+                await self._start_playback("play")
+            else:
+                await self._call("pause", spotify_api.pause, self._device_id)
         except Exception:
             self._clear_optimistic()
             raise
 
     async def async_media_next_track(self) -> None:
-        await self._call("next", spotify_api.next_track, self._device_id)
+        self._set_optimistic(playing=True, active=True)
+        try:
+            await self._call("next", spotify_api.next_track, self._device_id)
+        except Exception:
+            self._clear_optimistic()
+            raise
 
     async def async_media_previous_track(self) -> None:
-        await self._call("previous", spotify_api.previous_track, self._device_id)
+        self._set_optimistic(playing=True, active=True)
+        try:
+            await self._call("previous", spotify_api.previous_track, self._device_id)
+        except Exception:
+            self._clear_optimistic()
+            raise
 
     async def async_set_volume_level(self, volume: float) -> None:
         self._set_optimistic(volume=volume)
