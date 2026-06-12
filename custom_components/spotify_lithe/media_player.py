@@ -36,7 +36,11 @@ SUPPORT = (
 
 OPTIMISTIC_TTL = 8.0          # seconds an override is trusted before reality must win
 REPOLL_DELAYS = (1.0, 3.0)    # extra refreshes after a command, to outrun Spotify lag
-TOGGLE_DEBOUNCE = 0.3         # coalesce rapid play/pause toggles before hitting the device
+# A pause->resume within this window collapses to the final intent (no device pause/resume
+# round-trip). Set wide because resume-from-pause can starve the LWF1's audio pipeline
+# (cloud reports playing + progress, but no audio frames reach the speaker -> silence).
+# The optimistic overlay flips the card instantly, so this delay isn't visible in the UI.
+TOGGLE_DEBOUNCE = 1.2         # coalesce play<->pause toggles before hitting the device
 MIN_CMD_GAP = 0.3             # minimum spacing between device commands (protects a fragile LWF1)
 
 
